@@ -7,18 +7,15 @@ import (
 
 	"github.com/go-redis/redis/v8"
 	"github.com/spf13/viper"
-	"github.com/joho/godotenv"
 )
 
 var RedisClient *redis.Client
+
+// Ctx is the shared background context for Redis operations
 var Ctx = context.Background()
 
-// InitializeRedis connects to Redis
+// InitializeRedis connects to Redis and validates the connection
 func InitializeRedis() error {
-	if err := godotenv.Load(); err != nil {
-		log.Println("Warning: .env file not found, using environment variables")
-	}
-
 	addr := viper.GetString("REDIS_ADDR")
 	if addr == "" {
 		addr = "localhost:6379"
@@ -33,17 +30,16 @@ func InitializeRedis() error {
 		DB:       db,
 	})
 
-	// Test connection
-	_, err := RedisClient.Ping(Ctx).Result()
-	if err != nil {
-		return fmt.Errorf("failed to connect to Redis: %v", err)
+	// Validate connection
+	if _, err := RedisClient.Ping(Ctx).Result(); err != nil {
+		return fmt.Errorf("failed to connect to Redis at %s: %v", addr, err)
 	}
 
-	log.Println("Redis connected successfully")
+	log.Printf("Redis connected: %s (db=%d)", addr, db)
 	return nil
 }
 
-// GetRedis returns the Redis client
+// GetRedis returns the global Redis client
 func GetRedis() *redis.Client {
 	return RedisClient
 }

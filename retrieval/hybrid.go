@@ -1,25 +1,24 @@
 package retrieval
 
 import (
-	"context"
-	"fmt"
-	"DualPath/models"
 	"DualPath/database"
 	"DualPath/milvus"
+	"DualPath/models"
+	"fmt"
 	"log"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 )
 
-// HybridRetriever combines Page Index (deterministic) and Vector DB (probabilistic)
+// HybridRetriever combines Page Index (deterministic) and Vector DB (probabilistic).
 type HybridRetriever struct {
 	EmbeddingFunc func(text string) ([]float32, error)
 }
 
-// SearchResult combines both PageIndex and Vector results
+// SearchResult is the unified result type returned from any retrieval path.
 type SearchResult struct {
 	DocumentID  string  `json:"document_id"`
 	PageNumber  int     `json:"page_number"`
@@ -32,55 +31,52 @@ type SearchResult struct {
 	Source      string  `json:"source"` // "page_index" or "vector_db"
 }
 
-// ProcessDocumentParallel processes a document with two parallel goroutines
+// ProcessDocumentParallel processes a document with two concurrent goroutines:
+//   - Vector Worker  → embeds chunks and stores in Milvus
+//   - Index Worker   → extracts structured metadata and stores in PostgreSQL
 func ProcessDocumentParallel(documentID, filePath string, textPages []string) error {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Error channels
 	vectorErr := make(chan error, 1)
 	indexErr := make(chan error, 1)
 
-	// Goroutine 1: Vector Worker - Send chunks to embedding model and Milvus
+	// --- Goroutine 1: Vector Worker ---
 	go func() {
 		defer wg.Done()
-		log.Printf("[Vector Worker] Starting vector processing for document: %s", documentID)
+		log.Printf("[Vector Worker] Processing document: %s", documentID)
 
-		// Simulate embedding and vector insertion
-		// In production, call real embedding API here
 		chunkSize := 512
 		var vectors [][]float32
 		var pageNumbers []int64
 		var texts []string
 
 		for pageNum, pageText := range textPages {
-			chunks := chunkText(pageText, chunkSize)
-			for _, chunk := range chunks {
+			for _, chunk := range chunkText(pageText, chunkSize) {
+				// TODO: replace make([]float32, N) with a real embedding API call
 				vectors = append(vectors, make([]float32, milvus.VectorDimension))
 				pageNumbers = append(pageNumbers, int64(pageNum+1))
 				texts = append(texts, chunk)
 			}
 		}
 
-		// Insert into Milvus
-		_, err := milvus.InsertVectors(documentID, vectors, pageNumbers, texts)
-		if err != nil {
+		if _, err := milvus.InsertVectors(documentID, vectors, pageNumbers, texts); err != nil {
 			vectorErr <- fmt.Errorf("vector processing failed: %v", err)
 			return
 		}
 
-		log.Printf("[Vector Worker] Completed vector processing for document: %s", documentID)
+		log.Printf("[Vector Worker] Done: %s", documentID)
 		vectorErr <- nil
 	}()
 
-	// Goroutine 2: Index Worker - Extract structural metadata to PostgreSQL
+	// --- Goroutine 2: Index Worker ---
 	go func() {
 		defer wg.Done()
-		log.Printf("[Index Worker] Starting structured indexing for document: %s", documentID)
+		log.Printf("[Index Worker] Processing document: %s", documentID)
 
 		db := database.GetDB()
 
-		// Create document record
+		// Record the document itself
 		document := models.Document{
 			DocumentID:  documentID,
 			FileName:    filePath[strings.LastIndex(filePath, "/")+1:],
@@ -88,91 +84,79 @@ func ProcessDocumentParallel(documentID, filePath string, textPages []string) er
 			TotalPages:  len(textPages),
 			IsProcessed: true,
 		}
-
 		if err := db.Create(&document).Error; err != nil {
-			indexErr <- fmt.Errorf("failed to create document: %v", err)
+			indexErr <- fmt.Errorf("failed to create document record: %v", err)
 			return
 		}
 
-		// Create page indexes
+		// Create one PageIndex row per page
 		for pageNum, pageText := range textPages {
 			keywords := extractKeywords(pageText)
-			summary := generateSummary(pageText)
-
 			pageIndex := models.PageIndex{
 				DocumentID:  documentID,
 				PageNumber:  pageNum + 1,
 				Keywords:    strings.Join(keywords, ", "),
-				Summary:     summary,
-				OffsetStart: int64(pageNum * 1000), // Simplified offset calculation
+				Summary:     generateSummary(pageText),
+				OffsetStart: int64(pageNum * 1000),
 				OffsetEnd:   int64((pageNum + 1) * 1000),
-				Metadata:    fmt.Sprintf(`{"headers": [], "tables": %d}`, countTables(pageText)),
+				Metadata:    fmt.Sprintf(`{"headers":[],"tables":%d}`, countTables(pageText)),
 			}
-
 			if err := db.Create(&pageIndex).Error; err != nil {
-				indexErr <- fmt.Errorf("failed to create page index: %v", err)
+				indexErr <- fmt.Errorf("failed to create page index (page %d): %v", pageNum+1, err)
 				return
 			}
 		}
 
-		log.Printf("[Index Worker] Completed structured indexing for document: %s", documentID)
+		log.Printf("[Index Worker] Done: %s", documentID)
 		indexErr <- nil
 	}()
 
-	// Wait for both workers
 	wg.Wait()
 
-	// Check for errors
 	if err := <-vectorErr; err != nil {
 		return err
 	}
-	if err := <-indexErr; err != nil {
-		return err
-	}
-
-	return nil
+	return <-indexErr
 }
 
-// HybridSearch performs hybrid retrieval combining deterministic and probabilistic search
+// HybridSearch executes hybrid retrieval:
+//  1. Direct page-number lookup (deterministic, score=1.0)
+//  2. Semantic vector search (probabilistic, score=0–1)
+//  3. Merge, deduplicate, rank by score
 func (hr *HybridRetriever) HybridSearch(query string, topK int) ([]SearchResult, error) {
 	var results []SearchResult
-	db := database.GetDB()
 
-	// Step 1: Direct Lookup - Check if query mentions specific page or section
-	if pageIndexResults, found := hr.directPageLookup(query); found {
-		results = append(results, pageIndexResults...)
-		log.Printf("[Hybrid Search] Found direct page lookup results: %d", len(pageIndexResults))
+	// Step 1: Deterministic lookup for explicit page references
+	if pageResults, found := hr.directPageLookup(query); found {
+		results = append(results, pageResults...)
+		log.Printf("[HybridSearch] Direct lookup: %d result(s)", len(pageResults))
 	}
 
-	// Step 2: Semantic Search - Query Milvus for broad queries
-	if hr.isSemanticQuery(query) {
+	// Step 2: Semantic search — run when query is broad OR no direct results found
+	if hr.isSemanticQuery(query) || len(results) == 0 {
 		queryVector, err := hr.EmbeddingFunc(query)
 		if err != nil {
-			log.Printf("[Hybrid Search] Failed to generate embedding: %v", err)
+			log.Printf("[HybridSearch] Embedding failed: %v", err)
 		} else {
 			vectorResults, err := milvus.SearchVectors(queryVector, topK)
 			if err != nil {
-				log.Printf("[Hybrid Search] Vector search failed: %v", err)
+				log.Printf("[HybridSearch] Vector search failed: %v", err)
 			} else {
-				// Re-anchor vector results to their original locations
-				anchoredResults := hr.anchorVectorResults(vectorResults)
-				results = append(results, anchoredResults...)
-				log.Printf("[Hybrid Search] Found vector search results: %d", len(anchoredResults))
+				anchored := hr.anchorVectorResults(vectorResults)
+				results = append(results, anchored...)
+				log.Printf("[HybridSearch] Vector search: %d result(s)", len(anchored))
 			}
 		}
 	}
 
-	// Step 3: Context Merging - Combine and deduplicate results
-	results = hr.mergeResults(results, topK)
-
-	return results, nil
+	// Step 3: Merge and return top-K
+	return hr.mergeResults(results, topK), nil
 }
 
-// directPageLookup checks if query mentions a specific page
+// directPageLookup checks whether the query explicitly names one or more pages
+// (e.g. "what is on page 4?") and returns those PageIndex records.
 func (hr *HybridRetriever) directPageLookup(query string) ([]SearchResult, bool) {
 	db := database.GetDB()
-
-	// Extract page numbers from query
 	pagePattern := regexp.MustCompile(`page\s*(\d+)`)
 	matches := pagePattern.FindAllStringSubmatch(strings.ToLower(query), -1)
 
@@ -185,7 +169,6 @@ func (hr *HybridRetriever) directPageLookup(query string) ([]SearchResult, bool)
 		if len(match) < 2 {
 			continue
 		}
-
 		pageNum, err := strconv.Atoi(match[1])
 		if err != nil {
 			continue
@@ -202,7 +185,7 @@ func (hr *HybridRetriever) directPageLookup(query string) ([]SearchResult, bool)
 				Keywords:    idx.Keywords,
 				OffsetStart: idx.OffsetStart,
 				OffsetEnd:   idx.OffsetEnd,
-				Score:       1.0, // Direct match gets highest score
+				Score:       1.0, // exact match → highest confidence
 				Source:      "page_index",
 			})
 		}
@@ -211,52 +194,60 @@ func (hr *HybridRetriever) directPageLookup(query string) ([]SearchResult, bool)
 	return results, len(results) > 0
 }
 
-// isSemanticQuery checks if query is broad enough for semantic search
+// isSemanticQuery returns true when the query contains natural-language
+// indicators that suggest a broad semantic search is appropriate.
 func (hr *HybridRetriever) isSemanticQuery(query string) bool {
-	// Check if query contains keywords that indicate semantic search
-	semanticIndicators := []string{
+	indicators := []string{
 		"explain", "describe", "what is", "how does", "why", "tell me",
-		"summary", "overview", "information about",
+		"summary", "overview", "information about", "details about",
 	}
-
 	lowerQuery := strings.ToLower(query)
-	for _, indicator := range semanticIndicators {
-		if strings.Contains(lowerQuery, indicator) {
+	for _, ind := range indicators {
+		if strings.Contains(lowerQuery, ind) {
 			return true
 		}
 	}
-
 	return false
 }
 
-// anchorVectorResults re-anchors vector results to Page Index
-func (hr *HybridRetriever) anchorVectorResults(vectorResults []entity.SearchResult) []SearchResult {
+// anchorVectorResults converts Milvus search results into SearchResults,
+// enriching each with its PageIndex metadata (keywords, summary, offsets).
+//
+// FIX (original): used entity.SearchResult (wrong type from SDK's client package),
+// panicked on empty data via unsafe type assertions, and needlessly parsed vector IDs
+// to recover document/page info that is now returned directly by SearchVectors.
+func (hr *HybridRetriever) anchorVectorResults(vectorResults []milvus.VectorSearchResult) []SearchResult {
 	db := database.GetDB()
 	var results []SearchResult
 
-	for _, vResult := range vectorResults {
-		documentID := vResult.ID.(string) // This should be the vector ID, need to parse
-
-		// Parse document ID from vector ID (format: docID_chunk_N_page_N)
-		docID := extractDocumentIDFromVectorID(vResult.ID.(string))
-		pageNumber := extractPageNumberFromVectorID(vResult.ID.(string))
-
-		// Get PageIndex entry for this document and page
+	for _, vr := range vectorResults {
 		var pageIndex models.PageIndex
-		if err := db.Where("document_id = ? AND page_number = ?", docID, pageNumber).First(&pageIndex).Error; err != nil {
-			log.Printf("[Anchor Result] PageIndex not found for doc=%s page=%d: %v", docID, pageNumber, err)
+		err := db.Where("document_id = ? AND page_number = ?",
+			vr.DocumentID, int(vr.PageNumber)).First(&pageIndex).Error
+
+		if err != nil {
+			// PageIndex missing — still surface the result with vector-DB data
+			log.Printf("[Anchor] PageIndex not found doc=%s page=%d: %v",
+				vr.DocumentID, vr.PageNumber, err)
+			results = append(results, SearchResult{
+				DocumentID:  vr.DocumentID,
+				PageNumber:  int(vr.PageNumber),
+				TextContent: vr.TextContent,
+				Score:       vr.Score,
+				Source:      "vector_db",
+			})
 			continue
 		}
 
 		results = append(results, SearchResult{
-			DocumentID:  docID,
+			DocumentID:  vr.DocumentID,
 			PageNumber:  pageIndex.PageNumber,
 			Summary:     pageIndex.Summary,
 			Keywords:    pageIndex.Keywords,
-			TextContent: vResult.Fields.GetColumn("text_content").(*entity.ColumnVarChar).Data()[0].(string),
+			TextContent: vr.TextContent,
 			OffsetStart: pageIndex.OffsetStart,
 			OffsetEnd:   pageIndex.OffsetEnd,
-			Score:       vResult.Score,
+			Score:       vr.Score,
 			Source:      "vector_db",
 		})
 	}
@@ -264,22 +255,24 @@ func (hr *HybridRetriever) anchorVectorResults(vectorResults []entity.SearchResu
 	return results
 }
 
-// mergeResults combines and deduplicates results
+// mergeResults deduplicates by (document_id, page_number), sorts by score
+// descending, and trims to topK.
+//
+// FIX: replaced O(n²) bubble sort with sort.Slice.
 func (hr *HybridRetriever) mergeResults(results []SearchResult, topK int) []SearchResult {
-	// Sort by score (highest first)
-	sortByScore(results)
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Score > results[j].Score
+	})
 
-	// Deduplicate by document_id + page_number
 	seen := make(map[string]bool)
-	var merged []SearchResult
+	merged := make([]SearchResult, 0, topK)
 
-	for _, result := range results {
-		key := fmt.Sprintf("%s:%d", result.DocumentID, result.PageNumber)
+	for _, r := range results {
+		key := fmt.Sprintf("%s:%d", r.DocumentID, r.PageNumber)
 		if !seen[key] {
 			seen[key] = true
-			merged = append(merged, result)
+			merged = append(merged, r)
 		}
-
 		if len(merged) >= topK {
 			break
 		}
@@ -288,11 +281,11 @@ func (hr *HybridRetriever) mergeResults(results []SearchResult, topK int) []Sear
 	return merged
 }
 
-// Helper functions
-func chunkText(text string, chunkSize int) []string {
-	var chunks []string
-	words := strings.Fields(text)
+// --- Text processing helpers ---
 
+func chunkText(text string, chunkSize int) []string {
+	words := strings.Fields(text)
+	var chunks []string
 	for i := 0; i < len(words); i += chunkSize {
 		end := i + chunkSize
 		if end > len(words) {
@@ -300,77 +293,48 @@ func chunkText(text string, chunkSize int) []string {
 		}
 		chunks = append(chunks, strings.Join(words[i:end], " "))
 	}
-
 	return chunks
 }
 
 func extractKeywords(text string) []string {
-	// Simplified keyword extraction
- words := strings.Fields(strings.ToLower(text))
- keywords := make(map[string]bool)
+	// FIX: original had mixed tabs/spaces causing gofmt warnings
+	words := strings.Fields(strings.ToLower(text))
+	keywords := make(map[string]bool)
 
 	stopWords := map[string]bool{
-		"the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
-		"with", "by", "from", "of", "is", "are", "was", "were", "be", "been",
-		"have", "has", "had", "do", "does", "did", "will", "would", "could",
-		"should", "may", "might", "must", "this", "that", "these", "those",
+		"the": true, "a": true, "an": true, "and": true, "or": true,
+		"but": true, "in": true, "on": true, "at": true, "to": true,
+		"for": true, "with": true, "by": true, "from": true, "of": true,
+		"is": true, "are": true, "was": true, "were": true, "be": true,
+		"been": true, "have": true, "has": true, "had": true, "do": true,
+		"does": true, "did": true, "will": true, "would": true, "could": true,
+		"should": true, "may": true, "might": true, "must": true,
+		"this": true, "that": true, "these": true, "those": true,
 	}
 
 	for _, word := range words {
+		word = strings.Trim(word, ".,!?;:\"'()")
 		if len(word) > 3 && !stopWords[word] {
 			keywords[word] = true
 		}
 	}
 
-	var result []string
-	for word := range keywords {
-		result = append(result, word)
+	result := make([]string, 0, len(keywords))
+	for w := range keywords {
+		result = append(result, w)
 	}
-
 	return result
 }
 
 func generateSummary(text string) string {
-	// Simplified summary generation
-	words := strings.Split(text, " ")
-	maxLen := 50
-	if len(words) > maxLen {
-		return strings.Join(words[:maxLen], " ") + "..."
+	const maxWords = 50
+	words := strings.Fields(text)
+	if len(words) > maxWords {
+		return strings.Join(words[:maxWords], " ") + "..."
 	}
 	return text
 }
 
 func countTables(text string) int {
-	// Simplified table detection
 	return strings.Count(text, "|") / 2
-}
-
-func sortByScore(results []SearchResult) {
-	// Sort by score descending
-	for i := 0; i < len(results)-1; i++ {
-		for j := 0; j < len(results)-i-1; j++ {
-			if results[j].Score < results[j+1].Score {
-				results[j], results[j+1] = results[j+1], results[j]
-			}
-		}
-	}
-}
-
-func extractDocumentIDFromVectorID(vectorID string) string {
-	parts := strings.Split(vectorID, "_chunk_")
-	if len(parts) > 0 {
-		return parts[0]
-	}
-	return ""
-}
-
-func extractPageNumberFromVectorID(vectorID string) int {
-	parts := strings.Split(vectorID, "_page_")
-	if len(parts) > 1 {
-		num, err := strconv.Atoi(strings.Split(parts[1], "_")[0])
-		if err == nil {
-			return num
-		}
-	}
-	return 0
 }

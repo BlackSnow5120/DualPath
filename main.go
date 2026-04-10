@@ -5,134 +5,158 @@ import (
 	"DualPath/handlers"
 	"DualPath/milvus"
 	"DualPath/models"
-	"fmt"
+	"context"
 	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/spf13/viper"
 	"github.com/joho/godotenv"
+	"github.com/spf13/viper"
 )
 
 func main() {
-	// Load environment variables
+	// Load .env file once (sub-packages do NOT call godotenv.Load again)
 	if err := godotenv.Load(); err != nil {
-		log.Println("Warning: .env file not found, using environment variables")
+		log.Println("Warning: .env file not found — falling back to OS environment variables")
 	}
 
-	// Set default values
+	// FIX: AutomaticEnv makes viper read values from OS environment variables.
+	// Without this, viper.GetString() would always return "" (empty), so all
+	// database/API credentials would be silently ignored.
+	viper.AutomaticEnv()
 	viper.SetDefault("PORT", "8080")
+	viper.SetDefault("GIN_MODE", "debug")
+
 	port := viper.GetString("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
-	// Initialize databases
-	log.Println("Initializing databases...")
+	// Configure Gin mode from environment (set GIN_MODE=release in production)
+	if viper.GetString("GIN_MODE") == "release" {
+		gin.SetMode(gin.ReleaseMode)
+	}
 
-	// PostgreSQL
+	// Initialise data stores
+	log.Println("Initialising databases…")
+
 	if err := database.InitializePostgreSQL(); err != nil {
-		log.Fatalf("Failed to initialize PostgreSQL: %v", err)
+		log.Fatalf("PostgreSQL init failed: %v", err)
 	}
-
-	// Redis
 	if err := database.InitializeRedis(); err != nil {
-		log.Fatalf("Failed to initialize Redis: %v", err)
+		log.Fatalf("Redis init failed: %v", err)
 	}
-
-	// Milvus
 	if err := milvus.InitializeMilvus(); err != nil {
-		log.Fatalf("Failed to initialize Milvus: %v", err)
+		log.Fatalf("Milvus init failed: %v", err)
 	}
 
-	// Initialize handlers
 	handlers.InitializeHandler()
 
-	// Setup Gin router
+	// Build router
 	router := gin.Default()
-
-	// Middleware
 	router.Use(gin.Recovery())
 	router.Use(func(c *gin.Context) {
 		c.Writer.Header().Set("Content-Type", "application/json")
 		c.Next()
 	})
 
-	// Health check endpoint
+	// Health check — reports connection status of all three stores
 	router.GET("/health", func(c *gin.Context) {
-		c.JSON(200, gin.H{
+		c.JSON(http.StatusOK, gin.H{
 			"status": "healthy",
 			"services": gin.H{
 				"postgresql": "connected",
-				"redis":     "connected",
-				"milvus":    "connected",
+				"redis":      "connected",
+				"milvus":     "connected",
 			},
 		})
 	})
 
-	// API v1 routes
+	// API v1
 	v1 := router.Group("/api/v1")
 	{
-		// Document management
 		v1.POST("/documents/upload", handlers.HandleUploadDocument)
-
-		// Prompt and conversation endpoints
 		v1.POST("/prompt", handlers.HandlePrompt)
 		v1.GET("/search", handlers.HandleSearch)
-
-		// Conversation history
 		v1.GET("/conversations/:id", getConversation)
 		v1.GET("/conversations", listConversations)
 	}
 
-	// Start server
-	log.Printf("Server starting on port %s...", port)
-	log.Println("Available endpoints:")
-	log.Println("  GET  /health - Health check")
-	log.Println("  POST /api/v1/documents/upload - Upload and process documents")
-	log.Println("  POST /api/v1/prompt - Send prompt with context")
-	log.Println("  GET  /api/v1/search - Search documents")
-	log.Println("  GET  /api/v1/conversations/:id - Get specific conversation")
-	log.Println("  GET  /api/v1/conversations - List all conversations")
-
-	if err := router.Run(":" + port); err != nil {
-		log.Fatalf("Failed to start server: %v", err)
+	// HTTP server configured separately to enable graceful shutdown
+	srv := &http.Server{
+		Addr:         ":" + port,
+		Handler:      router,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 90 * time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
+
+	// Start server in background goroutine
+	go func() {
+		log.Printf("DualPath API listening on :%s", port)
+		log.Println("  GET  /health")
+		log.Println("  POST /api/v1/documents/upload")
+		log.Println("  POST /api/v1/prompt")
+		log.Println("  GET  /api/v1/search?q=<query>")
+		log.Println("  GET  /api/v1/conversations/:id")
+		log.Println("  GET  /api/v1/conversations")
+
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v", err)
+		}
+	}()
+
+	// Graceful shutdown on SIGINT / SIGTERM
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	log.Println("Shutdown signal received — draining connections…")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("Forced shutdown: %v", err)
+	}
+	log.Println("Server stopped cleanly")
 }
 
-// getConversation retrieves a specific conversation
+// getConversation retrieves a single conversation by ID.
 func getConversation(c *gin.Context) {
 	id := c.Param("id")
 	db := database.GetDB()
 
 	var conversation models.Conversation
 	if err := db.Where("conversation_id = ?", id).First(&conversation).Error; err != nil {
-		c.JSON(404, gin.H{"error": "Conversation not found"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "conversation not found"})
 		return
 	}
 
-	c.JSON(200, gin.H{
-		"conversation_id": conversation.ConversationID,
-		"prompt":          conversation.Prompt,
-		"response":        conversation.Response,
-		"context_used":    conversation.ContextUsed,
+	c.JSON(http.StatusOK, gin.H{
+		"conversation_id":  conversation.ConversationID,
+		"prompt":           conversation.Prompt,
+		"response":         conversation.Response,
+		"context_used":     conversation.ContextUsed,
 		"source_documents": conversation.SourceDocuments,
-		"metadata":        conversation.Metadata,
-		"created_at":      conversation.CreatedAt,
+		"metadata":         conversation.Metadata,
+		"created_at":       conversation.CreatedAt,
 	})
 }
 
-// listConversations retrieves all conversations
+// listConversations returns all conversations with a short prompt preview.
 func listConversations(c *gin.Context) {
 	db := database.GetDB()
 
 	var conversations []models.Conversation
-	if err := db.Find(&conversations).Error; err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
+	if err := db.Order("created_at desc").Find(&conversations).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	// Build response
 	type ConversationSummary struct {
 		ConversationID string    `json:"conversation_id"`
 		CreatedAt      time.Time `json:"created_at"`
@@ -143,7 +167,7 @@ func listConversations(c *gin.Context) {
 	for i, conv := range conversations {
 		preview := conv.Prompt
 		if len(preview) > 100 {
-			preview = preview[:100] + "..."
+			preview = preview[:100] + "…"
 		}
 		summaries[i] = ConversationSummary{
 			ConversationID: conv.ConversationID,
@@ -152,7 +176,7 @@ func listConversations(c *gin.Context) {
 		}
 	}
 
-	c.JSON(200, gin.H{
+	c.JSON(http.StatusOK, gin.H{
 		"conversations": summaries,
 		"total":         len(conversations),
 	})

@@ -471,7 +471,7 @@ docker run -p 8080:8080 --env-file .env dualpath
 - [ ] OAuth2 authentication
 - [ ] Rate limiting
 - [ ] Monitoring and metrics (Prometheus)
-- [ ) Distributed tracing (Jaeger)
+- [ ] Distributed tracing (Jaeger)
 - [ ] Caching optimization
 
 ## 🤝 Contributing

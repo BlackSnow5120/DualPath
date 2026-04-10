@@ -1,32 +1,26 @@
 package database
 
 import (
-	"fmt"
 	"DualPath/models"
+	"fmt"
 	"log"
 
 	"github.com/jinzhu/gorm"
 	_ "github.com/jinzhu/gorm/dialects/postgres"
 	"github.com/spf13/viper"
-	"github.com/joho/godotenv"
 )
 
 var DB *gorm.DB
 
-// InitializePostgreSQL connects to PostgreSQL and creates tables
+// InitializePostgreSQL connects to PostgreSQL and auto-migrates models
 func InitializePostgreSQL() error {
-	// Load environment variables
-	if err := godotenv.Load(); err != nil {
-		log.Println("Warning: .env file not found, using environment variables")
-	}
-
 	host := viper.GetString("DB_HOST")
 	port := viper.GetString("DB_PORT")
 	user := viper.GetString("DB_USER")
 	password := viper.GetString("DB_PASSWORD")
 	dbname := viper.GetString("DB_NAME")
 
-	// Set defaults
+	// Apply defaults for missing values
 	if host == "" {
 		host = "localhost"
 	}
@@ -40,23 +34,34 @@ func InitializePostgreSQL() error {
 		dbname = "dualpath"
 	}
 
-	psqlInfo := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
-		host, port, user, password, dbname)
+	dsn := fmt.Sprintf(
+		"host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+		host, port, user, password, dbname,
+	)
 
 	var err error
-	DB, err = gorm.Open("postgres", psqlInfo)
+	DB, err = gorm.Open("postgres", dsn)
 	if err != nil {
-		return fmt.Errorf("failed to connect to database: %v", err)
+		return fmt.Errorf("failed to connect to PostgreSQL: %v", err)
 	}
 
-	// Auto-migrate models
-	DB.AutoMigrate(&models.PageIndex{}, &models.Document{}, &models.Conversation{}, &models.VectorIndexLink{})
+	// Enable connection pool settings
+	DB.DB().SetMaxIdleConns(10)
+	DB.DB().SetMaxOpenConns(100)
 
-	log.Println("PostgreSQL connected and tables created successfully")
+	// Auto-migrate all models
+	DB.AutoMigrate(
+		&models.PageIndex{},
+		&models.Document{},
+		&models.Conversation{},
+		&models.VectorIndexLink{},
+	)
+
+	log.Printf("PostgreSQL connected: %s:%s/%s", host, port, dbname)
 	return nil
 }
 
-// GetDB returns the database connection
+// GetDB returns the global database connection
 func GetDB() *gorm.DB {
 	return DB
 }
