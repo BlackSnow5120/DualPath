@@ -215,7 +215,7 @@ func SearchVectors(queryVector []float32, topK int) ([]VectorSearchResult, error
 	var pageNumData []int64
 	var textData []string
 
-	for _, col := range sr.FieldData {
+	for _, col := range sr.Fields {
 		switch col.Name() {
 		case "document_id":
 			if c, ok := col.(*entity.ColumnVarChar); ok {
