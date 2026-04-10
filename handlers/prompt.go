@@ -170,7 +170,7 @@ func HandleUploadDocument(c *gin.Context) {
 		"This is page 3 content. It outlines the return and refund policy.",
 	}
 
-	if err := retrieval.ProcessDocumentParallel(documentID, filePath, textPages); err != nil {
+	if err := retrieval.ProcessDocumentParallel(documentID, filePath, textPages, hybridRetriever.EmbeddingFunc); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}

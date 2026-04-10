@@ -34,7 +34,7 @@ type SearchResult struct {
 // ProcessDocumentParallel processes a document with two concurrent goroutines:
 //   - Vector Worker  → embeds chunks and stores in Milvus
 //   - Index Worker   → extracts structured metadata and stores in PostgreSQL
-func ProcessDocumentParallel(documentID, filePath string, textPages []string) error {
+func ProcessDocumentParallel(documentID, filePath string, textPages []string, embedFunc func(string) ([]float32, error)) error {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -53,8 +53,12 @@ func ProcessDocumentParallel(documentID, filePath string, textPages []string) er
 
 		for pageNum, pageText := range textPages {
 			for _, chunk := range chunkText(pageText, chunkSize) {
-				// TODO: replace make([]float32, N) with a real embedding API call
-				vectors = append(vectors, make([]float32, milvus.VectorDimension))
+				vec, err := embedFunc(chunk)
+				if err != nil {
+					log.Printf("[Vector Worker] Embedding failed for chunk in doc %s: %v", documentID, err)
+					vec = make([]float32, milvus.VectorDimension) // Fallback to zero vector
+				}
+				vectors = append(vectors, vec)
 				pageNumbers = append(pageNumbers, int64(pageNum+1))
 				texts = append(texts, chunk)
 			}
